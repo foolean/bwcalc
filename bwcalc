@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+'''
+bwcalc - Network bandwidth/throughput calculator
+'''
+
+# Import standard libraries
+import argparse
+import re
+import sys
+
+
+# pylint: disable=too-few-public-methods
+class ExtendAction(argparse.Action):
+    '''
+    Extend ArgParse actions to create custom actions
+    '''
+    def __call__(self, parser, namespace, values, option_string=None):
+        items = getattr(namespace, self.dest) or []
+        items.extend(values)
+        setattr(namespace, self.dest, items)
+# pylint: enable=too-few-public-methods
+
+
+def get_rwnd(upload):
+    '''
+    Get the window size (RWND) from the system
+
+    Arguments:
+        upload  - Boolean to specify if we're uploading
+
+    Returns:
+        rwnd    - Maximum window size (tcp_wmem or tcp_rmem)
+    '''
+    # Set the file we need to read
+    # If we're uploading then nwe want tcp_wmem otherwise we want tcp_rmem
+    if upload is True:
+        rwnd_file = '/proc/sys/net/ipv4/tcp_wmem'
+    else:
+        rwnd_file = '/proc/sys/net/ipv4/tcp_rmem'
+
+    try:
+        handle = open(rwnd_file, 'r')
+    except OSError as err:
+        print('unable to open %s: %s' % (rwnd_file, err))
+        sys.exit(1)
+
+    data = handle.read()
+    try:
+        handle.close()
+    except OSError as err:
+        print('unable to close %s: %s' % (rwnd_file, err))
+
+    return int(data.split()[2])
+
+
+def valid_size(size):
+    '''
+    Helper routine to validate a user supplied byte-size value
+
+    Arguments:
+        size    - Integer size, in bytes (e.g 104857600)
+
+    Returns:
+        human   - Human representation of the size (e.g. 100MB)
+
+    Exceptions:
+        ArgumentTypeError   - size is not an integer or doesn't exist
+    '''
+    # Convert the size to bytes
+    size_bytes = human_to_bytes(size, 1024)
+
+    # If we received 'None' then it's not valid
+    if not size_bytes:
+        raise argparse.ArgumentTypeError('Invalid size "%s"' % (size))
+
+    # Convert the bytes back into human readable and return
+    return bytes_to_human(size_bytes, 1024)
+
+
+def valid_speed(speed):
+    '''
+    Helper routine to validate a user supplied speed value
+
+    Arguments:
+        speed   - Integer speed, in bits (e.g. 1000000)
+
+    Returns:
+        human   - Human representation of the speed (e.g. 1Gb)
+
+    Exceptions:
+        ArgumentTypeError   - speed is not an integer or doesn't exist
+    '''
+    # Convert the speed to bits
+    speed_bits = human_to_bits(speed, 1000)
+
+    # If we received 'None' then it's not valid
+    if not speed_bits:
+        raise argparse.ArgumentTypeError('Invalid speed "%s"' % (speed))
+
+    # Convert the bits back into human readable and return
+    return bits_to_human(speed_bits, 1000)
+
+
+def append_string(string, value):
+    '''
+    Helper function to handle sane string appending
+
+    Arguments:
+        string  - string to append the value to
+        value   - string to be appended
+
+    Returns:
+        string  - fully appended stringg
+    '''
+
+    # If the string is '' then return the value
+    if string == '':
+        return value
+
+    # Return the appended strings
+    return '%s %s' % (string, value)
+
+
+def seconds_to_human(seconds):
+    '''
+    Convert seconds to a human readable string
+
+    Arguments:
+        seconds - Integer seconds to be converted
+
+    Returns:
+        human   - Human representation of the seconds
+                  (years, months, days, hours, minutes, seconds)
+    '''
+    seconds = int(seconds)
+    human = ''
+
+    # Calculate the number of years
+    years = int(seconds / 31557600)
+    seconds = seconds % 31557600
+    if years > 0:
+        human = append_string(human, '%s years' % (years))
+
+    # Calculate the number of months
+    months = int(seconds / 2629800)
+    seconds = seconds % 2629800
+    if months > 0:
+        human = append_string(human, '%s months' % (months))
+
+    # Calculate the number of days
+    days = int(seconds / 86400)
+    seconds = seconds % 86400
+    if days > 0:
+        human = append_string(human, '%s days' % (days))
+
+    # Calculate the number of hours
+    hours = int(seconds / 3600)
+    seconds = seconds % 3600
+    if hours > 0:
+        human = append_string(human, '%s hours' % (hours))
+
+    # Calculate the number of minutes and seconds
+    minutes = int(seconds / 60)
+    seconds = seconds % 60
+    if minutes > 0:
+        human = append_string(human, '%s minutes' % (minutes))
+    if seconds > 0:
+        human = append_string(human, '%s seconds' % (seconds))
+
+    # Return the human representation
+    return human
+
+
+def bytes_to_human(value, multiplier=1024):
+    '''
+    Convert bytes to a human readable string
+
+    Arguments:
+        value       - Integer bytes to be converted
+        multiplier  - Integer multiplier (e.g. 1024 vs 1000)
+
+    Returns:
+        human       - Human representation of the bytes (e.g. 100GB)
+    '''
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']:
+        if abs(value) < multiplier:
+            return '%3.2f%s' % (value, unit)
+        value /= multiplier
+
+    return value
+
+
+def bits_to_human(value, multiplier=1000):
+    '''
+    Convert bits to a human readable string
+
+    Arguments:
+        value       - Integer bits to be converted
+        multiplier  - Integer multiplier (e.g. 1000 vs 1024)
+
+    Returns:
+        human       - Human representation of the bits (e.g. 100Gb)
+    '''
+    for unit in ['b', 'Kb', 'Mb', 'Gb', 'Tb', 'Pb', 'Eb', 'Zb', 'Yb']:
+        if abs(value) < multiplier:
+            return '%3.2f%s' % (value, unit)
+        value /= multiplier
+
+    return value
+
+
+def human_to_bits(human, multiplier=1000):
+    '''
+    Convert a human size to bits
+
+    Arguments:
+        human       - Human representation of bits
+        multiplier  - Integer multiplier (e.g. 1000 vs 1024)
+
+    Returns:
+        value       - Integer bits
+    '''
+    scales = ['b', 'Kb', 'Mb', 'Gb', 'Tb', 'Pb', 'Eb', 'Zb', 'Yb']
+
+    # Split the incoming human size into the size and unit
+    # note: the first field is junk so we'll skip it
+    (speed, unit) = re.split(r'([.\d]+)', human)[1:]
+
+    # Convert the unit to first character upper
+    unit = unit.lower()
+    if unit != 'b':
+        unit = unit.capitalize()
+
+    # Ensure that 'b' is appended
+    if 'b' not in unit:
+        unit = unit + 'b'
+
+    # Make sure we have a valid unit
+    if unit not in scales:
+        return None
+
+    # Convert the size into bits
+    bits = round(float(speed) * (multiplier ** scales.index(unit)))
+
+    return bits
+
+
+def human_to_bytes(human, multiplier=1024):
+    '''
+    Convert a human size (e.g. 100TB) to bytes
+
+    Arguments:
+        human       - Human representation of bytes
+        multiplier  - Integer multiplier (e.g. 1000 vs 1024)
+
+    Returns:
+        value       - Integer bytes
+    '''
+    scales = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+
+    # Split the incoming human size into the size and unit
+    # note: the first field is junk so we'll skip it
+    (size, unit) = re.split(r'([.\d]+)', human)[1:]
+
+    # Convert the unit to upper case
+    unit = unit.upper()
+
+    # Ensure that 'B' is appended
+    if 'B' not in unit:
+        unit = unit + 'B'
+
+    # Make sure that we have a valid unit
+    if unit not in scales:
+        return None
+
+    # Convert the size into bytes
+    value = round(float(size) * (multiplier ** scales.index(unit)))
+
+    return value
+
+
+def parse_arguments():
+    '''
+    Parse the command-line arguments
+
+    Arguments:
+        None
+
+    Returns:
+        options - Dictionary of all options
+    '''
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Network throughput calculator'
+        )
+    parser.register('action', 'extend', ExtendAction)
+
+    parser.add_argument(
+        '--data-size',
+        dest='data_size',
+        metavar='BYTES',
+        default=None,
+        type=valid_size,
+        help='Size of the data to be transferred',
+    )
+
+    parser.add_argument(
+        '--speed',
+        dest='link_speed',
+        default='1Gb',
+        type=valid_speed,
+        help='Link speed of the network [default: %(default)s]',
+    )
+
+    parser.add_argument(
+        '--upload',
+        dest='upload',
+        action='store_true',
+        help='Specify that this is an upload (uses tcp_wmem instead of tcp_rmem for rwnd)',
+    )
+
+    parser.add_argument(
+        '--rtt',
+        dest='rtt',
+        metavar='MILLISECONDS',
+        type=float,
+        default=10,
+        help='Round Trip Time (RTT) in milliseconds [default: %(default)s]',
+    )
+
+    parser.add_argument(
+        '--mtu',
+        dest='mtu',
+        default=1500,
+        metavar='BYTES',
+        type=int,
+        help='MTU of the path [default: %(default)s]',
+    )
+
+    parser.add_argument(
+        '--l2-overhead',
+        dest='l2_overhead',
+        default=38,
+        metavar='BYTES',
+        type=int,
+        help='L1/L2 frame overhead in bytes [default: %(default)s]',
+    )
+
+    parser.add_argument(
+        '--l3-overhead',
+        dest='l3_overhead',
+        default=40,
+        metavar='BYTES',
+        type=int,
+        help='L3 TCP/IP overhead in bytes [default: %(default)s]',
+    )
+
+    parser.add_argument(
+        '--rwnd',
+        dest='rwnd',
+        #default='104857600',
+        default=None,
+        type=valid_size,
+        help='TCP window (RWND) size in bytes [default: %(default)s]',
+    )
+
+    # Parse the command-line arguments
+    args = parser.parse_args()
+
+    args.link_speed_bits = human_to_bits(args.link_speed, 1000)
+    args.data_size_bytes = human_to_bytes(args.data_size, 1024)
+
+    if args.rwnd is None:
+        args.rwnd = bytes_to_human(get_rwnd(args.upload), 1024)
+    args.rwnd_bytes = human_to_bytes(args.rwnd, 1024)
+
+    # Return the arguments as a dictionary
+    return vars(args)
+
+
+def main():
+    '''
+    Main program processing
+    '''
+
+    # Load our command-line arguments
+    options = parse_arguments()
+
+    # Bandwidth Delay Product (BDP)
+    bdp = int(options['link_speed_bits'] * (options['rtt'] / 1000))
+
+    # Maximum Segment Size (MSS)
+    mss = options['mtu'] - options['l3_overhead']
+
+    # Theoretical maximum Frames Per Second (FPS)
+    fps = int((options['link_speed_bits'] / ((options['mtu'] + options['l2_overhead']) * 8)))
+
+    # Minimum Window Size
+    min_rwnd = int((options['link_speed_bits'] * (options['rtt'] / 1000)) / 8)
+
+    # Maximum speed of the link
+    max_link_speed = int(((options['mtu'] - options['l3_overhead']) * 8) * fps)
+
+    # Maximum speed based on the window size
+    max_rwnd_speed = int((options['rwnd_bytes'] * 8) / (options['rtt'] / 1000))
+
+    # Our maximum speed will be the slowest value
+    if max_link_speed <= max_rwnd_speed:
+        max_speed = max_link_speed
+    else:
+        max_speed = max_rwnd_speed
+
+    # Number of seconds to transfer the data
+    seconds = round((options['data_size_bytes'] * 8) / max_speed)
+
+    # Convert the number of seconds to transfer the data
+    # into human readable form
+    duration = seconds_to_human(seconds)
+
+    # Output everything
+    print('')
+    print('L1/L2 overhead:         %10s bytes' % (options['l2_overhead']))
+    print('L3 TCP/IP overhead:     %10s bytes' % (options['l3_overhead']))
+    print('MTU:                    %10s bytes' % (options['mtu']))
+    print('MSS:                    %10s bytes' % (mss))
+    print('RTT:                    %10s millisecond' % (options['rtt']))
+    print('FPS:                    %10s' % (fps))
+    print('TCP window (RWND) size: %10s bytes' % (options['rwnd_bytes']))
+    print('BDP:                    %10s bits' % (bdp))
+    print('Min RWND:               %10s bytes' % (min_rwnd))
+    print('')
+    print('Link speed:       %8s  %12sb/s' % (options['link_speed'], options['link_speed_bits']))
+    print('Max link speed:   %8s  %12sb/s' % (bits_to_human(max_link_speed), max_link_speed))
+    print('Max speed (RWND): %8s  %12sb/s' % (bits_to_human(max_rwnd_speed), max_rwnd_speed))
+    print('===========================================')
+    print('Max speed:        %8s  %12sb/s' % (bits_to_human(max_speed), max_speed))
+    print('')
+    print('Data:                    %s bytes (%s)' % (options['data_size_bytes'], options['data_size']))
+    print('Min seconds to transfer: %s' % (seconds))
+    print('Min Transfer time:       %s' % (duration))
+
+    print('')
+    print('%s at %s/s will take at least %s' % (options['data_size'], bits_to_human(max_speed), duration))
+    return
+
+
+# Allow other programs to source this one as a library
+if __name__ == '__main__':
+    try:
+        main()
+    finally:
+        sys.exit(0)
